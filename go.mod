@@ -8,3 +8,5 @@ require (
 	github.com/stretchr/testify v1.7.0
 	go.uber.org/zap v1.19.0
 )
+
+replace github.com/go-logr/logr => github.com/pohly/logr v1.0.1-0.20210913074637-ca15dec7dec0
