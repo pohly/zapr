@@ -477,3 +477,20 @@ type CallStackHelperLogSink interface {
 	// call site information.
 	GetCallStackHelper() func()
 }
+
+// Marshaler is an optional interface that logged values may choose to
+// implement. Loggers with structured output like JSON should
+// log the object return by the GetLogObject method instead of the
+// original value.
+//
+// This can be used:
+//   - to ensure that structs are not logged as string when the original
+//     value has a String method: return a different type without String
+//     method
+//   - to select which fields of a complex type should get logged:
+//     return a simpler struct with less fields
+//   - to log unexported fields: return an anonymous struct
+//     with exported fields
+type LogObject interface {
+	GetLogObject() interface{}
+}
