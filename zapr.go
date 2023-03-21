@@ -97,10 +97,11 @@ const (
 	noLevel = -1
 )
 
-// handleFields converts a bunch of arbitrary key-value pairs into Zap fields.  It takes
-// additional pre-converted Zap fields, for use with automatically attached fields, like
-// `error`.
-func (zl *zapLogger) handleFields(lvl int, args []interface{}, additional ...zap.Field) []zap.Field {
+var skipField = zap.Skip()
+
+// handleFields stores a bunch of arbitrary key-value pairs in a single zap.Field.
+// The actual conversion happens when zap encodes a log entry.
+func (zl *zapLogger) handleFields(lvl int, args []interface{}, additional zap.Field) zap.Field {
 	injectNumericLevel := zl.numericLevelKey != "" && lvl != noLevel
 
 	// a slightly modified version of zap.SugaredLogger.sweetenFields
@@ -110,62 +111,86 @@ func (zl *zapLogger) handleFields(lvl int, args []interface{}, additional ...zap
 			return additional
 		}
 		// Slightly slower fast path when we need to inject "v".
-		return append(additional, zap.Int(zl.numericLevelKey, lvl))
+		return zap.Inline(zapcore.ObjectMarshalerFunc(func(enc zapcore.ObjectEncoder) error {
+			additional.AddTo(enc)
+			enc.AddInt(zl.numericLevelKey, lvl)
+			return nil
+		}))
 	}
 
-	// unlike Zap, we can be pretty sure users aren't passing structured
-	// fields (since logr has no concept of that), so guess that we need a
-	// little less space.
-	numFields := len(args)/2 + len(additional)
-	if injectNumericLevel {
-		numFields++
-	}
-	fields := make([]zap.Field, 0, numFields)
-	if injectNumericLevel {
-		fields = append(fields, zap.Int(zl.numericLevelKey, lvl))
-	}
-	for i := 0; i < len(args); {
-		// Check just in case for strongly-typed Zap fields,
-		// which might be illegal (since it breaks
-		// implementation agnosticism). If disabled, we can
-		// give a better error message.
-		if field, ok := args[i].(zap.Field); ok {
-			if zl.allowZapFields {
-				fields = append(fields, field)
-				i++
-				continue
-			}
-			if zl.panicMessages {
+	// Validate key/value pairs while we can still determine where an incorrect call comes from.
+	if zl.panicMessages {
+		for i := 0; i < len(args); {
+			// Check just in case for strongly-typed Zap fields,
+			// which might be illegal (since it breaks
+			// implementation agnosticism). If disabled, we can
+			// give a better error message.
+			if _, ok := args[i].(zap.Field); ok {
+				if zl.allowZapFields {
+					i++
+					continue
+				}
 				zl.l.WithOptions(zap.AddCallerSkip(1)).DPanic("strongly-typed Zap Field passed to logr", zapIt("zap field", args[i]))
+				break
 			}
-			break
-		}
 
-		// make sure this isn't a mismatched key
-		if i == len(args)-1 {
-			if zl.panicMessages {
+			// make sure this isn't a mismatched key
+			if i == len(args)-1 {
 				zl.l.WithOptions(zap.AddCallerSkip(1)).DPanic("odd number of arguments passed as key-value pairs for logging", zapIt("ignored key", args[i]))
+				break
 			}
-			break
-		}
 
-		// process a key-value pair,
-		// ensuring that the key is a string
-		key, val := args[i], args[i+1]
-		keyStr, isString := key.(string)
-		if !isString {
-			// if the key isn't a string, DPanic and stop logging
-			if zl.panicMessages {
+			// process a key-value pair,
+			// ensuring that the key is a string
+			key := args[i]
+			_, isString := key.(string)
+			if !isString {
+				// if the key isn't a string, DPanic and stop logging
 				zl.l.WithOptions(zap.AddCallerSkip(1)).DPanic("non-string key argument passed to logging, ignoring all later arguments", zapIt("invalid key", key))
+				break
 			}
-			break
+			i += 2
 		}
-
-		fields = append(fields, zapIt(keyStr, val))
-		i += 2
 	}
 
-	return append(fields, additional...)
+	return zap.Inline(zapcore.ObjectMarshalerFunc(func(enc zapcore.ObjectEncoder) error {
+		if injectNumericLevel {
+			enc.AddInt(zl.numericLevelKey, lvl)
+		}
+		for i := 0; i < len(args); {
+			// Check just in case for strongly-typed Zap fields,
+			// which might be illegal (since it breaks
+			// implementation agnosticism). If disabled, we can
+			// give a better error message.
+			if field, ok := args[i].(zap.Field); ok {
+				if zl.allowZapFields {
+					field.AddTo(enc)
+					i++
+					continue
+				}
+				break
+			}
+
+			// make sure this isn't a mismatched key
+			if i == len(args)-1 {
+				break
+			}
+
+			// process a key-value pair,
+			// ensuring that the key is a string
+			key, val := args[i], args[i+1]
+			keyStr, isString := key.(string)
+			if !isString {
+				// if the key isn't a string, DPanic and stop logging
+				break
+			}
+
+			zapIt(keyStr, val).AddTo(enc)
+			i += 2
+		}
+		additional.AddTo(enc)
+		return nil
+	}))
 }
 
 func zapIt(field string, val interface{}) zap.Field {
@@ -207,19 +232,33 @@ func (zl zapLogger) Enabled(lvl int) bool {
 
 func (zl *zapLogger) Info(lvl int, msg string, keysAndVals ...interface{}) {
 	if checkedEntry := zl.l.Check(toZapLevel(lvl), msg); checkedEntry != nil {
-		checkedEntry.Write(zl.handleFields(lvl, keysAndVals)...)
+		field := zl.handleFields(lvl, keysAndVals, skipField)
+		if field.Type == zapcore.SkipType {
+			checkedEntry.Write()
+		} else {
+			checkedEntry.Write(field)
+		}
 	}
 }
 
 func (zl *zapLogger) Error(err error, msg string, keysAndVals ...interface{}) {
 	if checkedEntry := zl.l.Check(zap.ErrorLevel, msg); checkedEntry != nil {
-		checkedEntry.Write(zl.handleFields(noLevel, keysAndVals, zap.NamedError(zl.errorKey, err))...)
+		field := zl.handleFields(noLevel, keysAndVals, zap.NamedError(zl.errorKey, err))
+		if field.Type == zapcore.SkipType {
+			checkedEntry.Write()
+		} else {
+			checkedEntry.Write(field)
+		}
 	}
 }
 
 func (zl *zapLogger) WithValues(keysAndValues ...interface{}) logr.LogSink {
+	field := zl.handleFields(noLevel, keysAndValues, skipField)
+	if field.Type == zapcore.SkipType {
+		return zl
+	}
 	newLogger := *zl
-	newLogger.l = zl.l.With(zl.handleFields(noLevel, keysAndValues)...)
+	newLogger.l = zl.l.With(field)
 	return &newLogger
 }
 
